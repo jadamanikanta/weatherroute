@@ -1,0 +1,104 @@
+
+.risk-rules-section {
+    width: 100%;
+    padding: 30px 24px;
+    background: var(--bg-color);
+}
+
+.risk-rules-container {
+    width: 100%;
+    max-width: 1240px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+}
+
+.risk-rules-card {
+    padding: 24px;
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+}
+
+.risk-rules-card h3 {
+    margin: 0 0 18px;
+    color: var(--heading-color);
+    font-size: 20px;
+}
+
+.load-rules-list,
+.recommendation-card ol {
+    padding-left: 25px;
+    margin: 0;
+}
+
+.load-rules-list li,
+.recommendation-card li {
+    padding: 6px 0;
+    color: var(--text-color);
+    line-height: 1.6;
+}
+
+.load-rules-list span {
+    color: #dc2626;
+    font-weight: 700;
+}
+
+.recommendation-card p {
+    color: var(--text-light);
+    margin: 0 0 12px;
+    line-height: 1.6;
+}
+
+.risk-table-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.risk-rules-table {
+    width: 100%;
+    min-width: 650px;
+    border-collapse: collapse;
+    text-align: center;
+}
+
+.risk-rules-table th,
+.risk-rules-table td {
+    padding: 11px 12px;
+    border: 1px solid var(--border-color);
+    color: var(--text-color);
+    font-size: 14px;
+    white-space: nowrap;
+}
+
+.risk-rules-table th {
+    background: var(--primary-light);
+    color: var(--heading-color);
+    font-weight: 700;
+}
+
+.risk-rules-table td:first-child {
+    font-weight: 700;
+    text-align: left;
+}
+
+@media (max-width: 768px) {
+    .risk-rules-section {
+        padding: 24px 16px;
+    }
+
+    .risk-rules-card {
+        padding: 18px;
+    }
+
+    .risk-rules-card h3 {
+        font-size: 18px;
+    }
+}
+
+@media (max-width: 360px) {
+    .risk-rules-section {
+        padding: 20px 12px;
+    }
+}
