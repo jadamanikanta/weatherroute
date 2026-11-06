@@ -7,6 +7,7 @@ import time
 import threading
 
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -25,10 +26,10 @@ WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 METERS_TO_MILES = 1609.344
 
 WEATHER_CACHE = {}
-WEATHER_CACHE_LOCK = threading.Lock()
-WEATHER_CACHE_TTL = 900
 
-WEATHER_BATCH_SIZE = 50
+WEATHER_CACHE_LOCK = threading.Lock()
+
+WEATHER_CACHE_TTL = 900
 
 
 def get_coordinates(place):
@@ -328,159 +329,120 @@ def get_risk_reason(weather, load_weight):
     elif snow >= 0.5:
         reasons.append("Snowfall is in the moderate-risk range.")
 
-    return reasons or [
-        "Weather conditions are within the low-risk range."
-    ]
+    return reasons or ["Weather conditions are within the low-risk range."]
 
+def get_weather_data(params, checkpoint):
 
-def get_weather_cache_key(checkpoint):
-
-    return (
+    cache_key = (
         round(float(checkpoint["latitude"]), 4),
         round(float(checkpoint["longitude"]), 4)
     )
 
+    with WEATHER_CACHE_LOCK:
 
-def get_weather_data_batch(checkpoints):
+        cached = WEATHER_CACHE.get(cache_key)
 
-    weather_results = {}
-    missing_checkpoints = []
+        if cached:
 
-    for checkpoint in checkpoints:
+            cache_age = time.monotonic() - cached["timestamp"]
 
-        cache_key = get_weather_cache_key(checkpoint)
-
-        with WEATHER_CACHE_LOCK:
-
-            cached = WEATHER_CACHE.get(cache_key)
-
-            if cached:
-
-                cache_age = (
-                    time.monotonic() - cached["timestamp"]
+            if cache_age < WEATHER_CACHE_TTL:
+                logger.info(
+                    "Using cached weather for checkpoint %s",
+                    cache_key
                 )
 
-                if cache_age < WEATHER_CACHE_TTL:
-                    weather_results[cache_key] = cached["data"]
-                    continue
+                return cached["data"]
 
-                WEATHER_CACHE.pop(cache_key, None)
+            WEATHER_CACHE.pop(cache_key, None)
 
-        missing_checkpoints.append(
-            (cache_key, checkpoint)
-        )
-
-    if not missing_checkpoints:
-        return weather_results
-
-    for start_index in range(
-        0,
-        len(missing_checkpoints),
-        WEATHER_BATCH_SIZE
-    ):
-
-        batch = missing_checkpoints[
-            start_index:start_index + WEATHER_BATCH_SIZE
-        ]
-
-        latitudes = ",".join(
-            str(item[1]["latitude"])
-            for item in batch
-        )
-
-        longitudes = ",".join(
-            str(item[1]["longitude"])
-            for item in batch
-        )
-
-        params = {
-            "latitude": latitudes,
-            "longitude": longitudes,
-            "hourly": "wind_speed_10m,rain,snowfall",
-            "wind_speed_unit": "mph",
-            "precipitation_unit": "inch",
-            "timezone": "GMT",
-            "forecast_days": 16
-        }
+    for attempt in range(4):
 
         try:
 
             response = requests.get(
                 WEATHER_URL,
                 params=params,
-                timeout=60
+                timeout=30
             )
 
             if response.status_code == 429:
 
-                logger.error(
-                    "Open-Meteo API limit reached: %s",
+                retry_after = response.headers.get("Retry-After")
+
+                try:
+                    wait_time = min(float(retry_after), 60)
+                except (TypeError, ValueError):
+                    wait_time = 2 ** (attempt + 1)
+
+                logger.warning(
+                    "Open-Meteo rate limit reached. "
+                    "Retry %s/4 after %s seconds. Response: %s",
+                    attempt + 1,
+                    wait_time,
                     response.text[:500]
                 )
 
-                raise requests.HTTPError(
-                    "Open-Meteo weather API daily limit reached. "
-                    "Please try again after the quota resets.",
-                    response=response
-                )
+                if attempt == 3:
+                    response.raise_for_status()
+
+                time.sleep(wait_time)
+
+                continue
 
             response.raise_for_status()
 
             data = response.json()
 
-            if isinstance(data, dict):
-                data = [data]
-
-            if (
-                not isinstance(data, list)
-                or len(data) != len(batch)
-            ):
+            if "hourly" not in data:
                 raise ValueError(
-                    "Weather API returned an unexpected batch response."
+                    "Weather service did not return hourly data."
                 )
 
-            for (cache_key, checkpoint), weather_data in zip(
-                batch,
-                data
-            ):
+            with WEATHER_CACHE_LOCK:
 
-                if (
-                    not isinstance(weather_data, dict)
-                    or "hourly" not in weather_data
-                ):
-                    raise ValueError(
-                        "Weather API returned incomplete checkpoint data."
-                    )
+                WEATHER_CACHE[cache_key] = {
+                    "timestamp": time.monotonic(),
+                    "data": data
+                }
 
-                weather_results[cache_key] = weather_data
-
-                with WEATHER_CACHE_LOCK:
-
-                    WEATHER_CACHE[cache_key] = {
-                        "timestamp": time.monotonic(),
-                        "data": weather_data
-                    }
+            return data
 
         except requests.RequestException:
 
             logger.exception(
-                "Open-Meteo batch request failed."
+                "Open-Meteo request failed at checkpoint %s",
+                cache_key
             )
 
             raise
 
-    return weather_results
-
+    raise requests.RequestException(
+        "Open-Meteo request failed after multiple retries."
+    )
 
 def fetch_weather(
     checkpoint,
     departure_time,
     arrival_time,
-    load_weight,
-    weather_data
+    load_weight
 ):
 
-    data = weather_data
+    params = {
+        "latitude": checkpoint["latitude"],
+        "longitude": checkpoint["longitude"],
+        "hourly": "wind_speed_10m,rain,snowfall",
+        "wind_speed_unit": "mph",
+        "precipitation_unit": "inch",
+        "timezone": "GMT",
+        "forecast_days": 16
+    }
+
+    data = get_weather_data(
+        params,
+        checkpoint
+    )
+
     hourly = data["hourly"]
 
     required_fields = [
@@ -641,13 +603,7 @@ def analyze_route(
     if not math.isfinite(route_duration) or route_duration <= 0:
         raise ValueError("Route duration is invalid.")
 
-    weather_by_location = get_weather_data_batch(
-        checkpoints
-    )
-
-    analyzed_checkpoints = []
-
-    for checkpoint in checkpoints:
+    def analyze_checkpoint(checkpoint):
 
         arrival_time = get_checkpoint_arrival(
             departure_time,
@@ -656,21 +612,27 @@ def analyze_route(
             total_distance
         )
 
-        cache_key = get_weather_cache_key(checkpoint)
-
         weather = fetch_weather(
             checkpoint,
             departure_time,
             arrival_time,
-            load_weight,
-            weather_by_location[cache_key]
+            load_weight
         )
 
-        analyzed_checkpoints.append({
+        return {
             **checkpoint,
             "arrival_time": arrival_time.isoformat(),
             **weather
-        })
+        }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+
+        analyzed_checkpoints = list(
+            executor.map(
+                analyze_checkpoint,
+                checkpoints
+            )
+        )
 
     risk_miles = {
         "Low": 0,
@@ -773,15 +735,12 @@ def create_route_analysis(data):
         )
 
     try:
-
         departure_time = datetime.fromisoformat(
             str(data["departure_time"]).replace(
                 "Z", "+00:00"
             )
         )
-
     except ValueError:
-
         raise ValueError(
             "Invalid departure time. Use an ISO 8601 date and time."
         )
@@ -808,11 +767,8 @@ def create_route_analysis(data):
         )
 
     try:
-
         load_weight = float(data["load_weight"])
-
     except (TypeError, ValueError):
-
         raise ValueError(
             "Load weight must be a valid number."
         )
@@ -823,11 +779,8 @@ def create_route_analysis(data):
         )
 
     try:
-
         interval = int(data.get("interval", 25))
-
     except (TypeError, ValueError):
-
         raise ValueError(
             "Choose a 10, 25 or 50 mile interval."
         )
