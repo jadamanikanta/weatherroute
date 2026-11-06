@@ -3,6 +3,8 @@ import os
 import math
 import logging
 import requests
+import time
+import threading
 
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +24,12 @@ MAPBOX_BASE_URL = "https://api.mapbox.com"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 
 METERS_TO_MILES = 1609.344
+
+WEATHER_CACHE = {}
+
+WEATHER_CACHE_LOCK = threading.Lock()
+
+WEATHER_CACHE_TTL = 900
 
 
 def get_coordinates(place):
@@ -323,6 +331,95 @@ def get_risk_reason(weather, load_weight):
 
     return reasons or ["Weather conditions are within the low-risk range."]
 
+def get_weather_data(params, checkpoint):
+
+    cache_key = (
+        round(float(checkpoint["latitude"]), 4),
+        round(float(checkpoint["longitude"]), 4)
+    )
+
+    with WEATHER_CACHE_LOCK:
+
+        cached = WEATHER_CACHE.get(cache_key)
+
+        if cached:
+
+            cache_age = time.monotonic() - cached["timestamp"]
+
+            if cache_age < WEATHER_CACHE_TTL:
+                logger.info(
+                    "Using cached weather for checkpoint %s",
+                    cache_key
+                )
+
+                return cached["data"]
+
+            WEATHER_CACHE.pop(cache_key, None)
+
+    for attempt in range(4):
+
+        try:
+
+            response = requests.get(
+                WEATHER_URL,
+                params=params,
+                timeout=30
+            )
+
+            if response.status_code == 429:
+
+                retry_after = response.headers.get("Retry-After")
+
+                try:
+                    wait_time = min(float(retry_after), 60)
+                except (TypeError, ValueError):
+                    wait_time = 2 ** (attempt + 1)
+
+                logger.warning(
+                    "Open-Meteo rate limit reached. "
+                    "Retry %s/4 after %s seconds. Response: %s",
+                    attempt + 1,
+                    wait_time,
+                    response.text[:500]
+                )
+
+                if attempt == 3:
+                    response.raise_for_status()
+
+                time.sleep(wait_time)
+
+                continue
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if "hourly" not in data:
+                raise ValueError(
+                    "Weather service did not return hourly data."
+                )
+
+            with WEATHER_CACHE_LOCK:
+
+                WEATHER_CACHE[cache_key] = {
+                    "timestamp": time.monotonic(),
+                    "data": data
+                }
+
+            return data
+
+        except requests.RequestException:
+
+            logger.exception(
+                "Open-Meteo request failed at checkpoint %s",
+                cache_key
+            )
+
+            raise
+
+    raise requests.RequestException(
+        "Open-Meteo request failed after multiple retries."
+    )
 
 def fetch_weather(
     checkpoint,
@@ -341,26 +438,10 @@ def fetch_weather(
         "forecast_days": 16
     }
 
-    try:
-        response = requests.get(
-            WEATHER_URL,
-            params=params,
-            timeout=30
-        )
-        response.raise_for_status()
-
-    except requests.RequestException:
-        logger.exception(
-            "Open-Meteo request failed at checkpoint %s, %s.",
-            checkpoint["latitude"],
-            checkpoint["longitude"]
-        )
-        raise
-
-    data = response.json()
-
-    if "hourly" not in data:
-        raise ValueError("Weather service did not return hourly data.")
+    data = get_weather_data(
+        params,
+        checkpoint
+    )
 
     hourly = data["hourly"]
 
@@ -372,6 +453,7 @@ def fetch_weather(
     ]
 
     for field in required_fields:
+
         if field not in hourly:
             raise ValueError(
                 f"Weather forecast is missing {field}."
@@ -384,10 +466,13 @@ def fetch_weather(
         parsed_time = datetime.fromisoformat(value)
 
         if parsed_time.tzinfo is None:
+
             parsed_time = parsed_time.replace(
                 tzinfo=timezone.utc
             )
+
         else:
+
             parsed_time = parsed_time.astimezone(
                 timezone.utc
             )
@@ -395,9 +480,15 @@ def fetch_weather(
         weather_times.append(parsed_time)
 
     if not weather_times:
-        raise ValueError("No weather forecast times available.")
+        raise ValueError(
+            "No weather forecast times available."
+        )
 
-    if arrival_time < weather_times[0] or arrival_time > weather_times[-1]:
+    if (
+        arrival_time < weather_times[0]
+        or arrival_time > weather_times[-1]
+    ):
+
         raise ValueError(
             "Weather forecast is unavailable for the checkpoint arrival time."
         )
@@ -407,7 +498,9 @@ def fetch_weather(
         nearest_index = min(
             range(len(weather_times)),
             key=lambda index: abs(
-                (weather_times[index] - target_time).total_seconds()
+                (
+                    weather_times[index] - target_time
+                ).total_seconds()
             )
         )
 
@@ -455,7 +548,9 @@ def fetch_weather(
         if forecast_time > weather_times[-1]:
             break
 
-        forecast_weather = get_weather_at(forecast_time)
+        forecast_weather = get_weather_at(
+            forecast_time
+        )
 
         forecast.append({
             "hour": hour,
@@ -530,7 +625,7 @@ def analyze_route(
             **weather
         }
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
 
         analyzed_checkpoints = list(
             executor.map(
