@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 MAPBOX_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN")
 
 MAPBOX_BASE_URL = "https://api.mapbox.com"
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+WEATHER_URL = "https://weather.tk.gg/v1/forecast"
 
 METERS_TO_MILES = 1609.344
 
